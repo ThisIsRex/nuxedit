@@ -35,6 +35,11 @@ impl ImageRecord {
     pub fn area(&self) -> usize {
         self.header.width as usize * self.header.height as usize
     }
+
+    /// PNG dimensions after horizontal flip + 90° clockwise rotation.
+    pub fn output_dimensions(&self) -> (u16, u16) {
+        (self.header.height, self.header.width)
+    }
 }
 
 pub fn rgb565_to_rgb888(c: u16) -> [u8; 3] {
@@ -147,14 +152,20 @@ pub fn decode_image(clean_bina: &[u8], rec: &ImageRecord) -> Result<RgbImage> {
     let palette_offset = rec.offset + IMAGE_HEADER_SIZE;
     let rle_offset = palette_offset + header.palette_entries as usize * 2;
 
+    let src_w = header.width as usize;
+    let src_h = header.height as usize;
+    let out_w = src_h;
+    let out_h = src_w;
+
     let mut palette = Vec::with_capacity(header.palette_entries as usize);
     for i in 0..header.palette_entries as usize {
         let c = read_u16_le(clean_bina, palette_offset + i * 2)?;
         palette.push(rgb565_to_rgb888(c));
     }
 
-    let expected_pixels = header.width as usize * header.height as usize;
-    let mut rgb = Vec::with_capacity(expected_pixels * 3);
+    let expected_pixels = src_w * src_h;
+    let mut rgb = vec![0u8; expected_pixels * 3];
+    let mut src_idx = 0usize;
 
     for i in 0..header.rle_words as usize {
         let word = read_u16_le(clean_bina, rle_offset + i * 2)?;
@@ -162,18 +173,27 @@ pub fn decode_image(clean_bina: &[u8], rec: &ImageRecord) -> Result<RgbImage> {
         let color = palette[idx];
 
         for _ in 0..run {
-            rgb.extend_from_slice(&color);
+            ensure!(
+                src_idx < expected_pixels,
+                "RLE produced more pixels than width * height"
+            );
+
+            let x = src_idx % src_w;
+            let y = src_idx / src_w;
+            src_idx += 1;
+
+            // Undo horizontal mirror and rotate 90° clockwise: (x, y) -> (y, x).
+            let out_off = (x * out_w + y) * 3;
+            rgb[out_off..out_off + 3].copy_from_slice(&color);
         }
     }
 
     ensure!(
-        rgb.len() == expected_pixels * 3,
-        "decoded pixel count mismatch: got {}, expected {}",
-        rgb.len() / 3,
-        expected_pixels
+        src_idx == expected_pixels,
+        "decoded pixel count mismatch: got {src_idx}, expected {expected_pixels}"
     );
 
-    RgbImage::from_raw(header.width as u32, header.height as u32, rgb)
+    RgbImage::from_raw(out_w as u32, out_h as u32, rgb)
         .ok_or_else(|| anyhow::anyhow!("invalid RGB image buffer"))
         .context("failed to build RGB image")
 }

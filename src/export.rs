@@ -17,6 +17,8 @@ pub struct ManifestImageEntry {
     pub original_abs_offset: usize,
     pub width: u16,
     pub height: u16,
+    pub output_width: u16,
+    pub output_height: u16,
     pub bpp: u16,
     pub palette_entries: u16,
     pub rle_words: u32,
@@ -47,10 +49,9 @@ pub fn png_filename(
     original_abs: usize,
     record: &ImageRecord,
 ) -> String {
+    let (width, height) = record.output_dimensions();
     format!(
         "img_{index:04}_clean_{clean_abs:08x}_orig_{original_abs:08x}_{width}x{height}_bpp{bpp}_pal{palette_entries}.png",
-        width = record.header.width,
-        height = record.header.height,
         bpp = record.header.bpp,
         palette_entries = record.header.palette_entries,
     )
@@ -90,6 +91,8 @@ pub fn build_manifest_entry(
     let clean_abs_offset = bina_abs_offset + clean_bina_offset;
     let original_abs_offset = clean_bina_rel_to_original_abs(clean_bina_offset, bina_abs_offset);
 
+    let (output_width, output_height) = record.output_dimensions();
+
     ManifestImageEntry {
         index,
         png: png_rel_path.to_owned(),
@@ -98,6 +101,8 @@ pub fn build_manifest_entry(
         original_abs_offset,
         width: record.header.width,
         height: record.header.height,
+        output_width,
+        output_height,
         bpp: record.header.bpp,
         palette_entries: record.header.palette_entries,
         rle_words: record.header.rle_words,
