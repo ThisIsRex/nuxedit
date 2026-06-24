@@ -1,0 +1,15 @@
+[package]
+name = "nuxedit"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mg30_extract"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
