@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::container::{read_u16_le, read_u32_le};
 use crate::depacketize::clean_bina_rel_to_original_abs;
+use crate::hash::sha512_hex;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct WavFormat {
@@ -47,6 +48,7 @@ pub struct WavRecord {
     pub duration_seconds: f64,
 
     pub path: String,
+    pub sha512: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,7 +81,10 @@ pub fn parse_fmt_chunk(data: &[u8]) -> Result<WavFormat> {
     let block_align = read_u16_le(data, 12)?;
     let bits_per_sample = read_u16_le(data, 14)?;
 
-    ensure!(audio_format == 1, "unsupported audio format: {audio_format}");
+    ensure!(
+        audio_format == 1,
+        "unsupported audio format: {audio_format}"
+    );
     ensure!(
         (1..=2).contains(&channels),
         "invalid channel count: {channels}"
@@ -197,8 +202,7 @@ pub fn parse_wav_at(
 
     let clean_bina_offset = offset;
     let clean_abs_offset = bina_abs_offset + clean_bina_offset;
-    let original_abs_offset =
-        clean_bina_rel_to_original_abs(clean_bina_offset, bina_abs_offset);
+    let original_abs_offset = clean_bina_rel_to_original_abs(clean_bina_offset, bina_abs_offset);
 
     let duration_ms = (duration_seconds * 1000.0).round() as u64;
     let path = wav_filename(
@@ -234,6 +238,7 @@ pub fn parse_wav_at(
         sample_frames,
         duration_seconds,
         path,
+        sha512: String::new(),
     }))
 }
 
@@ -284,12 +289,13 @@ pub fn wav_filename(
     )
 }
 
-pub fn export_waves(clean_bina: &[u8], records: &[WavRecord], out_dir: &Path) -> Result<()> {
+pub fn export_waves(clean_bina: &[u8], records: &mut [WavRecord], out_dir: &Path) -> Result<()> {
     fs::create_dir_all(out_dir)?;
 
     for record in records {
         let path = out_dir.join(&record.path);
         let bytes = &clean_bina[record.clean_bina_offset..record.end_clean_bina_offset];
+        record.sha512 = sha512_hex(bytes);
         fs::write(&path, bytes)
             .with_context(|| format!("failed to write WAV {}", path.display()))?;
     }

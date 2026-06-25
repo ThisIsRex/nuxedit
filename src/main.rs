@@ -1,6 +1,7 @@
 mod container;
 mod depacketize;
 mod export;
+mod hash;
 mod image_format;
 mod scanner;
 mod waves;
@@ -14,14 +15,15 @@ use clap::{Parser, Subcommand};
 use container::{Firmware, dump_sections, parse_nux_dfu};
 use depacketize::depacketize_bina;
 use export::{
-    Manifest, ManifestSummary, build_manifest_entry, image_subdir, images_dir,
-    png_filename, write_manifest, write_png,
+    Manifest, ManifestSummary, build_manifest_entry, image_subdir, images_dir, png_filename,
+    write_manifest, write_png,
 };
+use hash::sha512_file;
 use image_format::decode_image;
 use scanner::find_image_records;
 use waves::{
-    WaveManifest, WaveManifestSummary, export_waves, filter_by_min_duration, find_waves,
-    waves_dir, write_wave_manifest,
+    WaveManifest, WaveManifestSummary, export_waves, filter_by_min_duration, find_waves, waves_dir,
+    write_wave_manifest,
 };
 
 #[derive(Parser, Debug)]
@@ -170,11 +172,7 @@ fn extract_images(args: ImagesArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", clean_path.display()))?;
     }
 
-    let bina_bytes = loaded
-        .fw
-        .section("BINA")
-        .map(|b| b.size)
-        .unwrap_or(0);
+    let bina_bytes = loaded.fw.section("BINA").map(|b| b.size).unwrap_or(0);
 
     println!(
         "BINA: raw size 0x{:x}, clean size 0x{:x}",
@@ -206,6 +204,7 @@ fn extract_images(args: ImagesArgs) -> Result<()> {
 
         let png_path = images_dir(&args.out_dir, subdir).join(&filename);
         write_png(&png_path, &image)?;
+        let sha512 = sha512_file(&png_path)?;
 
         let png_rel = format!("images/{subdir}/{filename}");
         manifest_entries.push(build_manifest_entry(
@@ -213,6 +212,7 @@ fn extract_images(args: ImagesArgs) -> Result<()> {
             record,
             loaded.bina_abs_offset,
             &png_rel,
+            sha512,
         ));
     }
 
@@ -271,11 +271,7 @@ fn extract_waves(args: WavesArgs) -> Result<()> {
             .with_context(|| format!("failed to write {}", clean_path.display()))?;
     }
 
-    let bina_bytes = loaded
-        .fw
-        .section("BINA")
-        .map(|b| b.size)
-        .unwrap_or(0);
+    let bina_bytes = loaded.fw.section("BINA").map(|b| b.size).unwrap_or(0);
 
     println!(
         "BINA: raw size 0x{:x}, clean size 0x{:x}",
@@ -283,17 +279,13 @@ fn extract_waves(args: WavesArgs) -> Result<()> {
         loaded.clean_bina.len()
     );
 
-    let mut records = find_waves(
-        &loaded.clean_bina,
-        loaded.bina_abs_offset,
-        args.scan_start,
-    )?;
+    let mut records = find_waves(&loaded.clean_bina, loaded.bina_abs_offset, args.scan_start)?;
     records = filter_by_min_duration(records, args.min_duration_ms);
 
     println!("Found {} WAV files", records.len());
 
     let out_waves_dir = waves_dir(&args.out_dir);
-    export_waves(&loaded.clean_bina, &records, &out_waves_dir)?;
+    export_waves(&loaded.clean_bina, &mut records, &out_waves_dir)?;
 
     let total_duration_seconds: f64 = records.iter().map(|r| r.duration_seconds).sum();
 

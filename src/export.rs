@@ -23,6 +23,7 @@ pub struct ManifestImageEntry {
     pub palette_entries: u16,
     pub rle_words: u32,
     pub record_size_bytes: usize,
+    pub sha512: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +87,7 @@ pub fn build_manifest_entry(
     record: &ImageRecord,
     bina_abs_offset: usize,
     png_rel_path: &str,
+    sha512: String,
 ) -> ManifestImageEntry {
     let clean_bina_offset = record.offset;
     let clean_abs_offset = bina_abs_offset + clean_bina_offset;
@@ -107,6 +109,7 @@ pub fn build_manifest_entry(
         palette_entries: record.header.palette_entries,
         rle_words: record.header.rle_words,
         record_size_bytes: record.record_size_bytes(),
+        sha512,
     }
 }
 

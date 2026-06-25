@@ -139,7 +139,10 @@ pub fn validate_image_record(buf: &[u8], off: usize) -> Option<ImageRecord> {
         return None;
     }
 
-    let record = ImageRecord { offset: off, header };
+    let record = ImageRecord {
+        offset: off,
+        header,
+    };
     if !validate_rle_stream(buf, &record) {
         return None;
     }
