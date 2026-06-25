@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use image::RgbImage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::depacketize::clean_bina_rel_to_original_abs;
 use crate::image_format::ImageRecord;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestImageEntry {
     pub index: usize,
     pub png: String,
@@ -23,9 +23,10 @@ pub struct ManifestImageEntry {
     pub palette_entries: u16,
     pub rle_words: u32,
     pub record_size_bytes: usize,
+    pub sha512: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestSummary {
     pub firmware_product: String,
     pub firmware_version: String,
@@ -37,7 +38,7 @@ pub struct ManifestSummary {
     pub large_threshold: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub summary: ManifestSummary,
     pub images: Vec<ManifestImageEntry>,
@@ -73,6 +74,13 @@ pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+pub fn load_manifest(path: &Path) -> Result<Manifest> {
+    let yaml = fs::read_to_string(path)
+        .with_context(|| format!("failed to read manifest {}", path.display()))?;
+    serde_yaml::from_str(&yaml)
+        .with_context(|| format!("failed to parse manifest {}", path.display()))
+}
+
 pub fn image_subdir(area: usize, large_threshold: usize) -> &'static str {
     if area >= large_threshold {
         "large"
@@ -86,6 +94,7 @@ pub fn build_manifest_entry(
     record: &ImageRecord,
     bina_abs_offset: usize,
     png_rel_path: &str,
+    sha512: String,
 ) -> ManifestImageEntry {
     let clean_bina_offset = record.offset;
     let clean_abs_offset = bina_abs_offset + clean_bina_offset;
@@ -107,6 +116,7 @@ pub fn build_manifest_entry(
         palette_entries: record.header.palette_entries,
         rle_words: record.header.rle_words,
         record_size_bytes: record.record_size_bytes(),
+        sha512,
     }
 }
 

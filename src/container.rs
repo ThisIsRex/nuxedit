@@ -60,7 +60,10 @@ fn is_printable_ascii_tag(tag: &[u8; 4]) -> bool {
 }
 
 pub fn parse_nux_dfu_header(data: &[u8]) -> Result<NuxDfuHeader> {
-    ensure!(data.len() >= SECTION_TABLE_OFFSET, "firmware file too small");
+    ensure!(
+        data.len() >= SECTION_TABLE_OFFSET,
+        "firmware file too small"
+    );
 
     let magic: [u8; 7] = data[0..7]
         .try_into()

@@ -33,9 +33,5 @@ pub fn clean_bina_rel_to_original_abs(clean_rel: usize, bina_abs_offset: usize) 
     let q = delta / FRAME_PAYLOAD_SIZE;
     let r = delta % FRAME_PAYLOAD_SIZE;
 
-    bina_abs_offset
-        + FRAME_START_BINA_REL
-        + q * FRAME_SIZE
-        + FRAME_HEADER_SIZE
-        + r
+    bina_abs_offset + FRAME_START_BINA_REL + q * FRAME_SIZE + FRAME_HEADER_SIZE + r
 }
