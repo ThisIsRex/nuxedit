@@ -5,11 +5,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use image::RgbImage;
 
+use crate::container::parse_nux_dfu;
 use crate::depacketize::clean_bina_rel_to_original_abs;
 use crate::export::{ManifestImageEntry, load_manifest};
 use crate::hash::sha512_file;
 use crate::image_format::{IMAGE_HEADER_SIZE, rgb565_to_rgb888, validate_bpp_and_palette};
-use crate::container::parse_nux_dfu;
 
 pub struct PackSummary {
     pub total: usize,

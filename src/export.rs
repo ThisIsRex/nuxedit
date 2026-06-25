@@ -77,7 +77,8 @@ pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
 pub fn load_manifest(path: &Path) -> Result<Manifest> {
     let yaml = fs::read_to_string(path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;
-    serde_yaml::from_str(&yaml).with_context(|| format!("failed to parse manifest {}", path.display()))
+    serde_yaml::from_str(&yaml)
+        .with_context(|| format!("failed to parse manifest {}", path.display()))
 }
 
 pub fn image_subdir(area: usize, large_threshold: usize) -> &'static str {
