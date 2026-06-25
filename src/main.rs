@@ -3,6 +3,7 @@ mod depacketize;
 mod export;
 mod hash;
 mod image_format;
+mod repack;
 mod scanner;
 mod waves;
 
@@ -20,6 +21,7 @@ use export::{
 };
 use hash::sha512_file;
 use image_format::decode_image;
+use repack::pack;
 use scanner::find_image_records;
 use waves::{
     WaveManifest, WaveManifestSummary, export_waves, filter_by_min_duration, find_waves, waves_dir,
@@ -40,6 +42,8 @@ enum Command {
     Images(ImagesArgs),
     /// Extract RIFF/WAVE audio from BINA
     Waves(WavesArgs),
+    /// Repack edited PNG images back into firmware
+    Pack(PackArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -90,6 +94,18 @@ struct WavesArgs {
     /// Write depacketized BINA to out_dir/sections/BINA.clean.bin
     #[arg(long)]
     dump_clean_bina: bool,
+}
+
+#[derive(Parser, Debug)]
+struct PackArgs {
+    /// Path to original firmware .bin file
+    firmware: PathBuf,
+
+    /// Extraction directory containing manifest.yaml and images/
+    out_dir: PathBuf,
+
+    /// Path for the patched output firmware
+    output: PathBuf,
 }
 
 struct LoadedBina {
@@ -330,11 +346,24 @@ fn extract_waves(args: WavesArgs) -> Result<()> {
     Ok(())
 }
 
+fn repack_images(args: PackArgs) -> Result<()> {
+    let summary = pack(&args.firmware, &args.out_dir, &args.output)?;
+
+    println!("Pack summary:");
+    println!("  manifest images: {}", summary.total);
+    println!("  unchanged:       {}", summary.skipped_unchanged);
+    println!("  patched:         {}", summary.patched);
+    println!("  output:          {}", args.output.display());
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Images(args) => extract_images(args),
         Command::Waves(args) => extract_waves(args),
+        Command::Pack(args) => repack_images(args),
     }
 }

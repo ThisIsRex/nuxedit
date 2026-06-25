@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use image::RgbImage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::depacketize::clean_bina_rel_to_original_abs;
 use crate::image_format::ImageRecord;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestImageEntry {
     pub index: usize,
     pub png: String,
@@ -26,7 +26,7 @@ pub struct ManifestImageEntry {
     pub sha512: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestSummary {
     pub firmware_product: String,
     pub firmware_version: String,
@@ -38,7 +38,7 @@ pub struct ManifestSummary {
     pub large_threshold: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub summary: ManifestSummary,
     pub images: Vec<ManifestImageEntry>,
@@ -72,6 +72,12 @@ pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     let yaml = serde_yaml::to_string(manifest).context("failed to serialize manifest YAML")?;
     fs::write(path, yaml).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+pub fn load_manifest(path: &Path) -> Result<Manifest> {
+    let yaml = fs::read_to_string(path)
+        .with_context(|| format!("failed to read manifest {}", path.display()))?;
+    serde_yaml::from_str(&yaml).with_context(|| format!("failed to parse manifest {}", path.display()))
 }
 
 pub fn image_subdir(area: usize, large_threshold: usize) -> &'static str {
