@@ -8,7 +8,7 @@ use image::RgbImage;
 use crate::depacketize::clean_bina_rel_to_original_abs;
 use crate::export::{ManifestImageEntry, load_manifest};
 use crate::hash::sha512_file;
-use crate::image_format::{IMAGE_HEADER_SIZE, rgb565_to_rgb888};
+use crate::image_format::{IMAGE_HEADER_SIZE, rgb565_to_rgb888, validate_bpp_and_palette};
 use crate::container::parse_nux_dfu;
 
 pub struct PackSummary {
@@ -99,17 +99,24 @@ fn build_palette(pixels: &[[u8; 3]], palette_entries: usize) -> (Vec<u16>, Vec<u
     (palette, indices)
 }
 
-fn rle_encode(indices: &[u8], bpp: u16) -> Vec<u16> {
+fn rle_encode(indices: &[u8], bpp: u16) -> Result<Vec<u16>> {
     if indices.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
+    let max_index = 1u16 << bpp;
     let max_run = 1usize << (16 - bpp);
     let mut words = Vec::new();
     let mut i = 0;
 
     while i < indices.len() {
         let idx = indices[i];
+        ensure!(
+            u16::from(idx) < max_index,
+            "palette index {idx} does not fit in bpp={bpp} (max index {})",
+            max_index - 1
+        );
+
         let mut run = 1usize;
         while i + run < indices.len() && indices[i + run] == idx && run < max_run {
             run += 1;
@@ -118,14 +125,21 @@ fn rle_encode(indices: &[u8], bpp: u16) -> Vec<u16> {
         i += run;
     }
 
-    words
+    Ok(words)
 }
 
 pub fn encode_record(entry: &ManifestImageEntry, png: &RgbImage) -> Result<Vec<u8>> {
+    validate_bpp_and_palette(entry.bpp, entry.palette_entries).with_context(|| {
+        format!(
+            "invalid bpp/palette_entries for index {} ({})",
+            entry.index, entry.png
+        )
+    })?;
+
     let pixels = extract_source_pixels(png, entry)?;
     let palette_entries = entry.palette_entries as usize;
     let (palette, indices) = build_palette(&pixels, palette_entries);
-    let rle_words = rle_encode(&indices, entry.bpp);
+    let rle_words = rle_encode(&indices, entry.bpp)?;
     let rle_word_count = rle_words.len();
 
     let mut out = Vec::with_capacity(entry.record_size_bytes);
@@ -195,6 +209,15 @@ fn patch_record(
 pub fn pack(firmware_path: &Path, out_dir: &Path, output_path: &Path) -> Result<PackSummary> {
     let manifest_path = out_dir.join("manifest.yaml");
     let manifest = load_manifest(&manifest_path)?;
+
+    for entry in &manifest.images {
+        validate_bpp_and_palette(entry.bpp, entry.palette_entries).with_context(|| {
+            format!(
+                "invalid manifest entry index {} ({}): bpp={}, palette_entries={}",
+                entry.index, entry.png, entry.bpp, entry.palette_entries
+            )
+        })?;
+    }
 
     let mut firmware = fs::read(firmware_path)
         .with_context(|| format!("failed to read firmware {}", firmware_path.display()))?;

@@ -61,6 +61,27 @@ pub fn decode_rle_word(word: u16, bpp: u16) -> (usize, usize) {
     (palette_index, run_length)
 }
 
+/// Maximum palette size allowed for a given `bpp` (firmware format cap: 256).
+pub fn max_palette_entries(bpp: u16) -> usize {
+    (1usize << bpp).min(256)
+}
+
+pub fn validate_bpp_and_palette(bpp: u16, palette_entries: u16) -> Result<()> {
+    ensure!(
+        (1..=8).contains(&bpp),
+        "bpp must be between 1 and 8, got {bpp}"
+    );
+
+    let max_palette = max_palette_entries(bpp);
+    let entries = palette_entries as usize;
+    ensure!(
+        (1..=max_palette).contains(&entries),
+        "palette_entries must be between 1 and {max_palette} for bpp={bpp}, got {palette_entries}"
+    );
+
+    Ok(())
+}
+
 fn parse_header(buf: &[u8], off: usize) -> Result<ImageRecordHeader> {
     Ok(ImageRecordHeader {
         bpp: read_u16_le(buf, off)?,
@@ -79,7 +100,7 @@ fn header_bounds_ok(header: &ImageRecordHeader, buf_len: usize, off: usize) -> b
         return false;
     }
 
-    let max_palette = (1usize << header.bpp).min(256);
+    let max_palette = max_palette_entries(header.bpp);
     if !(1..=max_palette).contains(&(header.palette_entries as usize)) {
         return false;
     }
@@ -199,4 +220,28 @@ pub fn decode_image(clean_bina: &[u8], rec: &ImageRecord) -> Result<RgbImage> {
     RgbImage::from_raw(out_w as u32, out_h as u32, rgb)
         .ok_or_else(|| anyhow::anyhow!("invalid RGB image buffer"))
         .context("failed to build RGB image")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_bpp_and_palette_accepts_known_values() {
+        validate_bpp_and_palette(1, 1).unwrap();
+        validate_bpp_and_palette(4, 14).unwrap();
+        validate_bpp_and_palette(8, 256).unwrap();
+    }
+
+    #[test]
+    fn validate_bpp_and_palette_rejects_invalid_bpp() {
+        assert!(validate_bpp_and_palette(0, 1).is_err());
+        assert!(validate_bpp_and_palette(9, 1).is_err());
+    }
+
+    #[test]
+    fn validate_bpp_and_palette_rejects_too_many_entries() {
+        assert!(validate_bpp_and_palette(4, 17).is_err());
+        assert!(validate_bpp_and_palette(8, 257).is_err());
+    }
 }
