@@ -30,7 +30,7 @@ mg30_extract images firmware.bin ./out
 - `out/sections/` — raw firmware sections (`TEXT.bin`, `BINA.bin`, `EXTR.bin`) and `BINA.clean.bin` (depacketized BINA)
 - `out/images/small/` — PNGs below the large threshold
 - `out/images/large/` — PNGs at or above the large threshold
-- `out/manifest.yaml` — metadata for every extracted image (offsets, dimensions, `bpp`, `palette_entries`, `record_size_bytes`, SHA-512)
+- `out/manifest.ron` — metadata for every extracted image (offsets, dimensions, `bpp`, `palette_entries`, `record_size_bytes`, SHA-512)
 
 **Options:**
 
@@ -60,7 +60,7 @@ mg30_extract waves firmware.bin ./out_waves
 **Output layout:**
 
 - `out_waves/waves/` — extracted `.wav` files
-- `out_waves/waves_manifest.yaml` — metadata for every extracted WAV
+- `out_waves/waves_manifest.ron` — metadata for every extracted WAV
 - `out_waves/sections/BINA.clean.bin` — only when `--dump-clean-bina` is set
 
 **Options:**
@@ -92,12 +92,12 @@ mg30_extract pack firmware.bin ./out ./firmware/patched.bin
 | Argument | Description |
 |----------|-------------|
 | `<FIRMWARE>` | Original firmware `.bin` used as the base |
-| `<OUT_DIR>` | Extraction directory with `manifest.yaml` and `images/` |
+| `<OUT_DIR>` | Extraction directory with `manifest.ron` and `images/` |
 | `<OUTPUT>` | Path for the patched output firmware |
 
 **How it works:**
 
-1. Reads `manifest.yaml` and checks every PNG against its stored SHA-512 hash.
+1. Reads `manifest.ron` and checks every PNG against its stored SHA-512 hash.
 2. Skips images whose hash matches the manifest (unchanged).
 3. Re-encodes changed PNGs into the firmware palette + RLE format and patches them in-place inside the BINA section (frame headers in the BINA tail are preserved automatically).
 4. Writes the full firmware to `<OUTPUT>` — all other bytes (header, TEXT, unmodified images, WAV data, EXTR, checksum field) stay as in the original.
@@ -109,7 +109,17 @@ mg30_extract pack firmware.bin ./out ./firmware/patched.bin
 - If the encoded result is smaller, the remainder of the slot is zero-padded.
 - `bpp` and `palette_entries` are taken from the manifest (not inferred from the PNG). They must satisfy `1 <= bpp <= 8` and `1 <= palette_entries <= min(2^bpp, 256)`.
 
-**If the image is too large**, try lowering `bpp` and/or `palette_entries` in `manifest.yaml` for that entry before running `pack`. Fewer palette colors mean a smaller palette block and often a more compact RLE stream, which may fit within `record_size_bytes`. Ensure the new values still cover the colors in your edited PNG (excess colors are quantized to the nearest palette entry).
+**If the image is too large**, try lowering `bpp` and/or `palette_entries` in `manifest.ron` for that entry before running `pack`. Fewer palette colors mean a smaller palette block and often a more compact RLE stream, which may fit within `record_size_bytes`. Ensure the new values still cover the colors in your edited PNG (excess colors are quantized to the nearest palette entry).
+
+```ron
+ManifestImageEntry(
+    index: 12,
+    png: "images/large/img_0012_....png",
+    bpp: 4,
+    palette_entries: 8,
+    // other fields stay as extracted
+)
+```
 
 To trigger repacking for an entry, the on-disk PNG hash must differ from `sha512` in the manifest — edit the PNG file, or update the hash after you are done editing.
 
