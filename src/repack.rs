@@ -7,7 +7,7 @@ use image::RgbImage;
 
 use crate::container::parse_nux_dfu;
 use crate::depacketize::clean_bina_rel_to_original_abs;
-use crate::export::{ManifestImageEntry, load_manifest};
+use crate::export::{MANIFEST_FILE, ManifestImageEntry, load_manifest};
 use crate::hash::sha512_file;
 use crate::image_format::{IMAGE_HEADER_SIZE, rgb565_to_rgb888, validate_bpp_and_palette};
 
@@ -207,7 +207,7 @@ fn patch_record(
 }
 
 pub fn pack(firmware_path: &Path, out_dir: &Path, output_path: &Path) -> Result<PackSummary> {
-    let manifest_path = out_dir.join("manifest.yaml");
+    let manifest_path = out_dir.join(MANIFEST_FILE);
     let manifest = load_manifest(&manifest_path)?;
 
     for entry in &manifest.images {

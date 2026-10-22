@@ -4,6 +4,7 @@ mod export;
 mod hash;
 mod image_format;
 mod repack;
+mod ron_io;
 mod scanner;
 mod waves;
 
@@ -16,16 +17,16 @@ use clap::{Parser, Subcommand};
 use container::{Firmware, dump_sections, parse_nux_dfu};
 use depacketize::depacketize_bina;
 use export::{
-    Manifest, ManifestSummary, build_manifest_entry, image_subdir, images_dir, png_filename,
-    write_manifest, write_png,
+    MANIFEST_FILE, Manifest, ManifestSummary, build_manifest_entry, image_subdir, images_dir,
+    png_filename, write_manifest, write_png,
 };
 use hash::sha512_file;
 use image_format::decode_image;
 use repack::pack;
 use scanner::find_image_records;
 use waves::{
-    WaveManifest, WaveManifestSummary, export_waves, filter_by_min_duration, find_waves, waves_dir,
-    write_wave_manifest,
+    WAVE_MANIFEST_FILE, WaveManifest, WaveManifestSummary, export_waves, filter_by_min_duration,
+    find_waves, waves_dir, write_wave_manifest,
 };
 
 #[derive(Parser, Debug)]
@@ -101,7 +102,7 @@ struct PackArgs {
     /// Path to original firmware .bin file
     firmware: PathBuf,
 
-    /// Extraction directory containing manifest.yaml and images/
+    /// Extraction directory containing manifest.ron and images/
     out_dir: PathBuf,
 
     /// Path for the patched output firmware
@@ -246,7 +247,7 @@ fn extract_images(args: ImagesArgs) -> Result<()> {
         images: manifest_entries,
     };
 
-    let manifest_path = args.out_dir.join("manifest.yaml");
+    let manifest_path = args.out_dir.join(MANIFEST_FILE);
     write_manifest(&manifest_path, &manifest)?;
 
     println!();
@@ -317,7 +318,7 @@ fn extract_waves(args: WavesArgs) -> Result<()> {
         waves: records,
     };
 
-    let manifest_path = args.out_dir.join("waves_manifest.yaml");
+    let manifest_path = args.out_dir.join(WAVE_MANIFEST_FILE);
     write_wave_manifest(&manifest_path, &manifest)?;
 
     println!();

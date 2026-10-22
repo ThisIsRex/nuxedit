@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::depacketize::clean_bina_rel_to_original_abs;
 use crate::image_format::ImageRecord;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManifestImageEntry {
     pub index: usize,
     pub png: String,
@@ -26,7 +26,7 @@ pub struct ManifestImageEntry {
     pub sha512: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManifestSummary {
     pub firmware_product: String,
     pub firmware_version: String,
@@ -38,7 +38,7 @@ pub struct ManifestSummary {
     pub large_threshold: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub summary: ManifestSummary,
     pub images: Vec<ManifestImageEntry>,
@@ -68,17 +68,14 @@ pub fn write_png(path: &Path, image: &RgbImage) -> Result<()> {
     Ok(())
 }
 
+pub const MANIFEST_FILE: &str = "manifest.ron";
+
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
-    let yaml = serde_yaml::to_string(manifest).context("failed to serialize manifest YAML")?;
-    fs::write(path, yaml).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    crate::ron_io::write_ron(path, manifest, "manifest")
 }
 
 pub fn load_manifest(path: &Path) -> Result<Manifest> {
-    let yaml = fs::read_to_string(path)
-        .with_context(|| format!("failed to read manifest {}", path.display()))?;
-    serde_yaml::from_str(&yaml)
-        .with_context(|| format!("failed to parse manifest {}", path.display()))
+    crate::ron_io::read_ron(path, "manifest")
 }
 
 pub fn image_subdir(area: usize, large_threshold: usize) -> &'static str {
@@ -122,4 +119,93 @@ pub fn build_manifest_entry(
 
 pub fn images_dir(out_dir: &Path, subdir: &str) -> PathBuf {
     out_dir.join("images").join(subdir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_manifest() -> Manifest {
+        Manifest {
+            summary: ManifestSummary {
+                firmware_product: "NUX MG-30".to_owned(),
+                firmware_version: "V1.0.2".to_owned(),
+                sections: vec!["TEXT".to_owned(), "BINA".to_owned(), "EXTR".to_owned()],
+                clean_bina_size: 4096,
+                image_count: 1,
+                small_count: 1,
+                large_count: 0,
+                large_threshold: 50_000,
+            },
+            images: vec![ManifestImageEntry {
+                index: 0,
+                png: "images/small/img_0000.png".to_owned(),
+                clean_bina_offset: 100,
+                clean_abs_offset: 200,
+                original_abs_offset: 300,
+                width: 16,
+                height: 32,
+                output_width: 32,
+                output_height: 16,
+                bpp: 4,
+                palette_entries: 14,
+                rle_words: 8,
+                record_size_bytes: 64,
+                sha512: "abc".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn manifest_round_trips_through_ron() {
+        let dir = std::env::temp_dir().join(format!("nuxedit-ron-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MANIFEST_FILE);
+        let manifest = sample_manifest();
+
+        write_manifest(&path, &manifest).unwrap();
+        let loaded = load_manifest(&path).unwrap();
+
+        assert_eq!(loaded, manifest);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_parses_without_struct_names() {
+        let ron = r#"
+(
+    summary: (
+        firmware_product: "NUX MG-30",
+        firmware_version: "V1.0.2",
+        sections: ["TEXT", "BINA", "EXTR"],
+        clean_bina_size: 4096,
+        image_count: 1,
+        small_count: 1,
+        large_count: 0,
+        large_threshold: 50000,
+    ),
+    images: [
+        (
+            index: 0,
+            png: "images/small/img_0000.png",
+            clean_bina_offset: 100,
+            clean_abs_offset: 200,
+            original_abs_offset: 300,
+            width: 16,
+            height: 32,
+            output_width: 32,
+            output_height: 16,
+            bpp: 4,
+            palette_entries: 14,
+            rle_words: 8,
+            record_size_bytes: 64,
+            sha512: "abc",
+        ),
+    ],
+)
+"#;
+
+        let parsed: Manifest = ron::from_str(ron).unwrap();
+        assert_eq!(parsed, sample_manifest());
+    }
 }
