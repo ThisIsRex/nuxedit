@@ -303,10 +303,10 @@ pub fn export_waves(clean_bina: &[u8], records: &mut [WavRecord], out_dir: &Path
     Ok(())
 }
 
+pub const WAVE_MANIFEST_FILE: &str = "waves_manifest.ron";
+
 pub fn write_wave_manifest(path: &Path, manifest: &WaveManifest) -> Result<()> {
-    let yaml = serde_yaml::to_string(manifest).context("failed to serialize wave manifest YAML")?;
-    fs::write(path, yaml).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    crate::ron_io::write_ron(path, manifest, "wave manifest")
 }
 
 pub fn waves_dir(out_dir: &Path) -> PathBuf {

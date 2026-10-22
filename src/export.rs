@@ -68,17 +68,14 @@ pub fn write_png(path: &Path, image: &RgbImage) -> Result<()> {
     Ok(())
 }
 
+pub const MANIFEST_FILE: &str = "manifest.ron";
+
 pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
-    let yaml = serde_yaml::to_string(manifest).context("failed to serialize manifest YAML")?;
-    fs::write(path, yaml).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    crate::ron_io::write_ron(path, manifest, "manifest")
 }
 
 pub fn load_manifest(path: &Path) -> Result<Manifest> {
-    let yaml = fs::read_to_string(path)
-        .with_context(|| format!("failed to read manifest {}", path.display()))?;
-    serde_yaml::from_str(&yaml)
-        .with_context(|| format!("failed to parse manifest {}", path.display()))
+    crate::ron_io::read_ron(path, "manifest")
 }
 
 pub fn image_subdir(area: usize, large_threshold: usize) -> &'static str {
