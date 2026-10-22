@@ -1,3 +1,4 @@
+mod banks;
 mod container;
 mod depacketize;
 mod export;
@@ -14,14 +15,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use banks::read_banks;
 use container::{Firmware, dump_sections, parse_nux_dfu};
 use depacketize::depacketize_bina;
 use export::{
-    MANIFEST_FILE, Manifest, ManifestSummary, build_manifest_entry, image_subdir, images_dir,
-    png_filename, write_manifest, write_png,
+    MANIFEST_FILE, Manifest, ManifestImageEntry, ManifestSummary, SCAN_BANK_NAME, bank_summary,
+    build_manifest_entry, image_subdir, images_dir, png_filename, write_manifest, write_png,
+    write_png_rgba,
 };
 use hash::sha512_file;
-use image_format::decode_image;
+use image_format::{ImageRecord, decode_pixels};
 use repack::pack;
 use scanner::find_image_records;
 use waves::{
@@ -55,23 +58,27 @@ struct ImagesArgs {
     /// Output directory
     out_dir: PathBuf,
 
-    /// Dump TEXT/BINA/EXTR sections to out_dir/sections/
-    #[arg(long, default_value_t = true)]
+    /// Dump TEXT/BINA/EXTR sections to out_dir/sections/ (`--dump-sections false` to skip)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     dump_sections: bool,
 
     /// Skip depacketizing the BINA tail frame wrapper
     #[arg(long)]
     no_depacketize: bool,
 
-    /// BINA-relative scan start offset (hex)
+    /// Use the heuristic scanner instead of the bank index tables (fallback for unknown layouts)
+    #[arg(long)]
+    scan: bool,
+
+    /// BINA-relative scan start offset (hex); scan mode only
     #[arg(long, default_value = "141f4a0", value_parser = parse_hex_usize)]
     scan_start: usize,
 
-    /// Minimum image area in pixels
+    /// Minimum image area in pixels; scan mode only
     #[arg(long, default_value_t = 1)]
     min_area: usize,
 
-    /// Pixel area threshold for images/large/
+    /// Pixel area threshold for images/large/; scan mode only
     #[arg(long, default_value_t = 50_000)]
     large_threshold: usize,
 }
@@ -197,41 +204,107 @@ fn extract_images(args: ImagesArgs) -> Result<()> {
         loaded.clean_bina.len()
     );
 
-    let records = find_image_records(&loaded.clean_bina, args.scan_start, args.min_area);
-    println!("Found {} image records", records.len());
-
-    let mut manifest_entries = Vec::with_capacity(records.len());
-    let mut small_count = 0usize;
-    let mut large_count = 0usize;
-
-    for (index, record) in records.iter().enumerate() {
-        let image = decode_image(&loaded.clean_bina, record)?;
-
-        let clean_abs = loaded.bina_abs_offset + record.offset;
-        let original_abs =
-            depacketize::clean_bina_rel_to_original_abs(record.offset, loaded.bina_abs_offset);
-        let filename = png_filename(index, clean_abs, original_abs, record);
-        let subdir = image_subdir(record.area(), args.large_threshold);
-
-        if subdir == "large" {
-            large_count += 1;
-        } else {
-            small_count += 1;
+    let banks = if args.scan {
+        None
+    } else {
+        match read_banks(&loaded.clean_bina) {
+            Ok(banks) => Some(banks),
+            Err(err) => {
+                eprintln!("warning: bank index tables not usable ({err:#}); falling back to scan");
+                None
+            }
         }
+    };
 
+    let mut manifest_entries: Vec<ManifestImageEntry> = Vec::new();
+    let mut bank_summaries = Vec::new();
+    let mut per_dir_counts: Vec<(String, usize)> = Vec::new();
+
+    let export_one = |record: &ImageRecord,
+                      bank: &str,
+                      bank_index: usize,
+                      subdir: &str,
+                      color_key: Option<u16>,
+                      manifest_entries: &mut Vec<ManifestImageEntry>|
+     -> Result<()> {
+        let decoded = decode_pixels(&loaded.clean_bina, record)
+            .with_context(|| format!("failed to decode {bank} image {bank_index}"))?;
+        let filename = png_filename(bank, bank_index, record);
         let png_path = images_dir(&args.out_dir, subdir).join(&filename);
-        write_png(&png_path, &image)?;
+        match color_key {
+            Some(key) => write_png_rgba(&png_path, &decoded.to_rgba_image(key)?)?,
+            None => write_png(&png_path, &decoded.to_rgb_image()?)?,
+        }
         let sha512 = sha512_file(&png_path)?;
-
         let png_rel = format!("images/{subdir}/{filename}");
         manifest_entries.push(build_manifest_entry(
-            index,
+            manifest_entries.len(),
+            bank,
+            bank_index,
             record,
             loaded.bina_abs_offset,
             &png_rel,
+            color_key,
             sha512,
         ));
-    }
+        Ok(())
+    };
+
+    let discovery = if let Some(banks) = &banks {
+        for bank in banks {
+            println!(
+                "Bank {:<5} table @ clean BINA 0x{:08x} (flash 0x{:08x}): {} entries ({} slots free), {} KiB used, {} KiB free",
+                bank.name(),
+                bank.table_bina_offset,
+                bank.layout.table_flash_address(),
+                bank.entries.len(),
+                bank.free_table_slots(),
+                bank.used_bytes() / 1024,
+                bank.free_bytes() / 1024,
+            );
+            let heights = bank.glyph_heights();
+            if !heights.is_empty() {
+                println!("           glyph heights: {heights:?}");
+            }
+            for entry in &bank.entries {
+                export_one(
+                    &entry.record,
+                    bank.name(),
+                    entry.index,
+                    bank.name(),
+                    bank.layout.color_key,
+                    &mut manifest_entries,
+                )?;
+            }
+            bank_summaries.push(bank_summary(bank));
+            per_dir_counts.push((bank.name().to_owned(), bank.entries.len()));
+        }
+        "table"
+    } else {
+        let records = find_image_records(&loaded.clean_bina, args.scan_start, args.min_area);
+        println!("Found {} image records by scanning", records.len());
+        let mut small_count = 0usize;
+        let mut large_count = 0usize;
+        for (index, record) in records.iter().enumerate() {
+            let subdir = image_subdir(record.area(), args.large_threshold);
+            if subdir == "large" {
+                large_count += 1;
+            } else {
+                small_count += 1;
+            }
+            export_one(
+                record,
+                SCAN_BANK_NAME,
+                index,
+                subdir,
+                None,
+                &mut manifest_entries,
+            )?;
+        }
+        per_dir_counts.push(("small".to_owned(), small_count));
+        per_dir_counts.push(("large".to_owned(), large_count));
+        "scan"
+    };
 
     let manifest = Manifest {
         summary: ManifestSummary {
@@ -239,10 +312,9 @@ fn extract_images(args: ImagesArgs) -> Result<()> {
             firmware_version: loaded.fw.header.version.clone(),
             sections: loaded.fw.sections.iter().map(|s| s.tag.clone()).collect(),
             clean_bina_size: loaded.clean_bina.len(),
+            discovery: discovery.to_owned(),
             image_count: manifest_entries.len(),
-            small_count,
-            large_count,
-            large_threshold: args.large_threshold,
+            banks: bank_summaries,
         },
         images: manifest_entries,
     };
@@ -254,17 +326,24 @@ fn extract_images(args: ImagesArgs) -> Result<()> {
     println!("Summary:");
     println!("  sections dumped: {}", args.dump_sections);
     println!("  clean BINA size: 0x{:x}", loaded.clean_bina.len());
+    println!("  discovery:       {discovery}");
     println!("  images total:    {}", manifest.summary.image_count);
-    println!("  small:           {}", small_count);
-    println!("  large:           {}", large_count);
+    for (dir, count) in &per_dir_counts {
+        println!("  images/{dir:<7} {count}");
+    }
     println!("  manifest:        {}", manifest_path.display());
 
     if let Some(first) = manifest.images.first() {
         println!();
         println!("First image:");
         println!(
-            "  {}x{}, bpp={}, palette_entries={}",
-            first.width, first.height, first.bpp, first.palette_entries
+            "  {} #{}: {}x{}, bpp={}, palette_entries={}",
+            first.bank,
+            first.bank_index,
+            first.width,
+            first.height,
+            first.bpp,
+            first.palette_entries
         );
         println!("  clean_abs_offset:    0x{:08x}", first.clean_abs_offset);
         println!("  original_abs_offset: 0x{:08x}", first.original_abs_offset);

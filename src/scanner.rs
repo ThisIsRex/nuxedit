@@ -1,6 +1,8 @@
-use crate::image_format::{ImageRecord, validate_image_record};
+//! Heuristic record scanner. Only used as a fallback when the bank index tables cannot be read
+//! (see [`crate::banks`]); it cannot find raw (bpp 0) images and cannot tell which bank an image
+//! belongs to.
 
-pub const IMAGE_SCAN_START_CANDIDATE_BINA_REL: usize = 0x0141f4a0;
+use crate::image_format::{ImageRecord, validate_image_record};
 
 pub fn find_image_records(
     clean_bina: &[u8],
@@ -11,10 +13,10 @@ pub fn find_image_records(
     let mut off = scan_start;
 
     while off + crate::image_format::IMAGE_HEADER_SIZE <= clean_bina.len() {
-        if let Some(record) = validate_image_record(clean_bina, off) {
-            if record.area() >= min_area {
-                records.push(record);
-            }
+        if let Some(record) = validate_image_record(clean_bina, off)
+            && record.area() >= min_area
+        {
+            records.push(record);
         }
         off += 4;
     }
