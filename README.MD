@@ -128,18 +128,22 @@ mg30_extract pack firmware.bin ./out ./firmware/patched.bin
 
 1. Reads `manifest.ron` and checks every PNG against its stored SHA-512 hash.
 2. Skips images whose hash matches the manifest (unchanged).
-3. Re-encodes changed PNGs into the firmware palette + RLE format and patches them in-place inside the BINA section (frame headers in the BINA tail are preserved automatically).
-4. Writes the full firmware to `<OUTPUT>` — all other bytes (header, TEXT, unmodified images, WAV data, EXTR, checksum field) stay as in the original.
+3. For a table manifest (`discovery: "table"`, the default extraction), every bank that contains a changed image is **rebuilt**: its records are packed again in `bank_index` order, 4-byte aligned, and the index table is regenerated. Unchanged images in that bank are copied byte for byte; banks with nothing changed are not touched. Frame headers in the BINA tail are preserved.
+4. For a scan manifest (`discovery: "scan"`) each changed record is patched in place inside its original slot.
+5. Writes the full firmware to `<OUTPUT>` — all other bytes (header, TEXT, unmodified banks, WAV data, EXTR, checksum field) stay as in the original.
+6. Reads the patched banks back and checks that changed records decode to the new pixels and untouched records are unchanged.
 
 **Editing constraints:**
 
-- PNG dimensions must match the manifest (`output_width` × `output_height` in the PNG file; `width` / `height` are the source dimensions in firmware layout).
-- Each re-encoded image record **must not exceed** `record_size_bytes` from the manifest. The slot size in firmware is fixed; if the new RLE stream is larger, `pack` fails with a "too large" error.
-- If the encoded result is smaller, the remainder of the slot is zero-padded.
+- A PNG may change size. It stays anchored at the same top-left corner, and it must fit the panel: 1..=800 px horizontal and 1..=480 px vertical. `width` / `height` / `output_*` / `record_size_bytes` in the manifest describe the **original** firmware; `pack` does not enforce them for table manifests.
+- For the `font` bank the table's glyph width is rewritten from the PNG, so the firmware advance (glyph width + 2) follows the new glyph.
+- The limit is the bank, not the old slot. A rebuilt bank must fit the flash region reserved for it (on the MG-30 V1.0.2 image that is about 708 KiB free in `font`, 696 KiB in `small`, 1.3 MiB in `large`). Shrinking one image frees room for another in the same bank. `pack` reports used and free space per bank.
+- Scan manifests still patch in place: the new record must fit `record_size_bytes`, and a shorter one is zero-padded.
 - `bpp` and `palette_entries` are taken from the manifest (not inferred from the PNG). They must satisfy `1 <= bpp <= 14` and `1 <= palette_entries <= 2^bpp`, or `bpp = 0` with `palette_entries = 0` for a raw RGB565 image (`12 + 2 * width * height` bytes).
 - For entries with a `color_key` (the `small` bank) the PNG is RGBA: pixels with alpha below 128 are written as the colour key and will be transparent on the device. Fully opaque magenta `(255, 28, 255)` is also the key colour and will be transparent too.
+- Do not add, remove or renumber manifest entries. `bank_index` is the firmware's image id.
 
-**If the image is too large**, try lowering `bpp` and/or `palette_entries` in `manifest.ron` for that entry before running `pack`. Fewer palette colors mean a smaller palette block and often a more compact RLE stream, which may fit within `record_size_bytes`. Ensure the new values still cover the colors in your edited PNG (excess colors are quantized to the nearest palette entry).
+**If a rebuilt bank no longer fits**, lower `bpp` and/or `palette_entries` in `manifest.ron` for the heavy entries before running `pack`. Fewer palette colors mean a smaller palette block and often a more compact RLE stream. Excess colors are quantized to the nearest palette entry.
 
 ```ron
 ManifestImageEntry(
