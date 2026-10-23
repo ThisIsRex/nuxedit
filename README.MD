@@ -71,7 +71,7 @@ Offsets are relative to the table base. Record format:
 u16 bpp              0 = raw RGB565 pixels, 1..=14 = palette index width
 u16 width            pixels along a framebuffer row (vertical on screen)
 u16 height           framebuffer rows (horizontal on screen)
-u16 palette_entries  up to 2^bpp RGB565 colours
+u16 palette_entries  up to min(2^bpp, 3000) RGB565 colours (firmware palette buffer)
 u32 rle_words        RLE word count (ignored for raw images)
 u16 palette[palette_entries]
 u16 rle[rle_words]   word = run-1 << bpp | palette_index   (or u16 pixels[width*height] for raw)
@@ -128,7 +128,7 @@ mg30_extract pack firmware.bin ./out ./firmware/patched.bin
 
 1. Reads `manifest.ron` and checks every PNG against its stored SHA-512 hash.
 2. Skips images whose hash matches the manifest (unchanged).
-3. For a table manifest (`discovery: "table"`, the default extraction), every bank that contains a changed image is **rebuilt**: its records are packed again in `bank_index` order, 4-byte aligned, and the index table is regenerated. Unchanged images in that bank are copied byte for byte; banks with nothing changed are not touched. Frame headers in the BINA tail are preserved.
+3. For a table manifest (`discovery: "table"`, the default extraction), every bank that contains a changed image is **rebuilt**: its records are packed again in `bank_index` order, 4-byte aligned, and the index table is regenerated. Changed images are re-encoded with a palette inferred from the PNG (see below). Unchanged images in that bank are copied byte for byte; banks with nothing changed are not touched. Frame headers in the BINA tail are preserved.
 4. For a scan manifest (`discovery: "scan"`) each changed record is patched in place inside its original slot.
 5. Writes the full firmware to `<OUTPUT>` — all other bytes (header, TEXT, unmodified banks, WAV data, EXTR, checksum field) stay as in the original.
 6. Reads the patched banks back and checks that changed records decode to the new pixels and untouched records are unchanged.
@@ -139,23 +139,17 @@ mg30_extract pack firmware.bin ./out ./firmware/patched.bin
 - For the `font` bank the table's glyph width is rewritten from the PNG, so the firmware advance (glyph width + 2) follows the new glyph.
 - The limit is the bank, not the old slot. A rebuilt bank must fit the flash region reserved for it (on the MG-30 V1.0.2 image that is about 708 KiB free in `font`, 696 KiB in `small`, 1.3 MiB in `large`). Shrinking one image frees room for another in the same bank. `pack` reports used and free space per bank.
 - Scan manifests still patch in place: the new record must fit `record_size_bytes`, and a shorter one is zero-padded.
-- `bpp` and `palette_entries` are taken from the manifest (not inferred from the PNG). They must satisfy `1 <= bpp <= 14` and `1 <= palette_entries <= 2^bpp`, or `bpp = 0` with `palette_entries = 0` for a raw RGB565 image (`12 + 2 * width * height` bytes).
-- For entries with a `color_key` (the `small` bank) the PNG is RGBA: pixels with alpha below 128 are written as the colour key and will be transparent on the device. Fully opaque magenta `(255, 28, 255)` is also the key colour and will be transparent too.
+- `bpp` and `palette_entries` are inferred from the changed PNG (`--palette auto`, the default). The encoder counts distinct RGB565 colours and writes the smallest bpp that holds them, so replacing an 8 bpp image with a 2-colour PNG stores bpp 1. A warning on stderr names every image whose depth no longer matches the manifest. Growth stays lossless up to `--max-bpp` (default 12, and never below the bpp already stored for that image) and the firmware limit of 3000 colours; past that the image is median-cut quantized and the warning reports the channel error. `--palette manifest` keeps the manifest bpp and quantizes to at most its `palette_entries`. A manifest `bpp` of 0 is always raw RGB565 (`12 + 2 * width * height` bytes) and is not inferred.
+- For entries with a `color_key` (the `small` bank) the PNG is RGBA: pixels with alpha below 128 are written as the colour key and will be transparent on the device. Fully opaque magenta `(255, 28, 255)` is also the key colour and will be transparent too. Quantization keeps the key as its own palette slot, so opaque pixels are not turned transparent.
 - Do not add, remove or renumber manifest entries. `bank_index` is the firmware's image id.
 
-**If a rebuilt bank no longer fits**, lower `bpp` and/or `palette_entries` in `manifest.ron` for the heavy entries before running `pack`. Fewer palette colors mean a smaller palette block and often a more compact RLE stream. Excess colors are quantized to the nearest palette entry.
+**If a rebuilt bank no longer fits**, the error lists the largest re-encoded records. Shrink those PNGs (fewer colours, or a smaller image) or rerun with a lower `--max-bpp`:
 
-```ron
-ManifestImageEntry(
-    index: 12,
-    bank: "large",
-    bank_index: 12,
-    png: "images/large/large_0012_....png",
-    bpp: 4,
-    palette_entries: 8,
-    // other fields stay as extracted
-)
+```bash
+mg30_extract pack --max-bpp 8 firmware.bin ./out ./firmware/patched.bin
 ```
+
+In `--palette manifest` mode the cap is the manifest instead: lower `bpp` and `palette_entries` on the heavy entries. `bpp` must be `1..=14` with `1 <= palette_entries <= min(2^bpp, 3000)`, or `0` with `palette_entries = 0` for raw.
 
 To trigger repacking for an entry, the on-disk PNG hash must differ from `sha512` in the manifest — edit the PNG file, or update the hash after you are done editing.
 
