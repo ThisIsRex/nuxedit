@@ -4,6 +4,7 @@ mod depacketize;
 mod export;
 mod hash;
 mod image_format;
+mod quantize;
 mod repack;
 mod ron_io;
 mod scanner;
