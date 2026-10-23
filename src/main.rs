@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use banks::read_banks;
 use container::{Firmware, dump_sections, parse_nux_dfu};
@@ -26,7 +26,7 @@ use export::{
 };
 use hash::sha512_file;
 use image_format::{ImageRecord, decode_pixels};
-use repack::pack;
+use repack::{MAX_AUTO_BPP, PackOptions, PaletteMode, pack};
 use scanner::find_image_records;
 use waves::{
     WAVE_MANIFEST_FILE, WaveManifest, WaveManifestSummary, export_waves, filter_by_min_duration,
@@ -105,6 +105,15 @@ struct WavesArgs {
     dump_clean_bina: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum PaletteArg {
+    /// Infer bpp and palette size from the PNG
+    #[default]
+    Auto,
+    /// Use bpp and palette_entries from the manifest
+    Manifest,
+}
+
 #[derive(Parser, Debug)]
 struct PackArgs {
     /// Path to original firmware .bin file
@@ -115,6 +124,15 @@ struct PackArgs {
 
     /// Path for the patched output firmware
     output: PathBuf,
+
+    /// Largest bpp automatic palette selection may grow to (1..=12).
+    /// The manifest bpp is a floor: an image is never quantized below the depth it already had.
+    #[arg(long, default_value_t = MAX_AUTO_BPP, value_parser = parse_max_bpp)]
+    max_bpp: u16,
+
+    /// Where bpp and palette size come from for a changed PNG
+    #[arg(long, value_enum, default_value_t = PaletteArg::Auto)]
+    palette: PaletteArg,
 }
 
 struct LoadedBina {
@@ -127,6 +145,17 @@ struct LoadedBina {
 fn parse_hex_usize(s: &str) -> Result<usize, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     usize::from_str_radix(s, 16).map_err(|e| e.to_string())
+}
+
+fn parse_max_bpp(s: &str) -> Result<u16, String> {
+    let value = s
+        .parse::<u16>()
+        .map_err(|err: std::num::ParseIntError| err.to_string())?;
+    if (1..=MAX_AUTO_BPP).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("max-bpp must be 1..={MAX_AUTO_BPP}, got {value}"))
+    }
 }
 
 fn load_firmware(firmware_path: &Path) -> Result<Vec<u8>> {
@@ -428,12 +457,27 @@ fn extract_waves(args: WavesArgs) -> Result<()> {
 }
 
 fn repack_images(args: PackArgs) -> Result<()> {
-    let summary = pack(&args.firmware, &args.out_dir, &args.output)?;
+    let options = PackOptions {
+        palette: match args.palette {
+            PaletteArg::Auto => PaletteMode::Auto,
+            PaletteArg::Manifest => PaletteMode::Manifest,
+        },
+        max_bpp: args.max_bpp,
+    };
+    let summary = pack(&args.firmware, &args.out_dir, &args.output, &options)?;
+
+    for report in summary.reports.iter().filter(|report| report.is_notable()) {
+        eprintln!("{}", report.warning());
+    }
 
     println!("Pack summary:");
     println!("  manifest images: {}", summary.total);
     println!("  unchanged:       {}", summary.skipped_unchanged);
     println!("  patched:         {}", summary.patched);
+    println!(
+        "  palette:         {} auto (lossless), {} quantized",
+        summary.auto_lossless, summary.auto_quantized
+    );
     for bank in &summary.banks {
         if bank.rebuilt {
             println!(
