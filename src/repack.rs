@@ -627,7 +627,7 @@ mod tests {
     fn round_trips_high_bpp_image() {
         let (w, h) = (40u32, 25u32);
         let png = gradient(w, h);
-        let e = entry(12, 4096, w as u16, h as u16, None);
+        let e = entry(12, 3000, w as u16, h as u16, None);
         let record = encode_record(&e, &png).unwrap();
         let rec = read_image_record(&record, 0).unwrap();
         assert_eq!(rec.header.bpp, 12);
@@ -674,7 +674,7 @@ mod tests {
     fn rejects_raw_with_palette_and_bpp_above_14() {
         assert!(validate_entry_format(&entry(0, 3, 1, 1, None)).is_err());
         assert!(validate_entry_format(&entry(15, 1, 1, 1, None)).is_err());
-        validate_entry_format(&entry(14, 16384, 1, 1, None)).unwrap();
+        validate_entry_format(&entry(14, 3000, 1, 1, None)).unwrap();
     }
 
     #[test]

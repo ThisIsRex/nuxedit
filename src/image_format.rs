@@ -14,9 +14,10 @@
 //! ```
 //!
 //! An RLE word packs `palette_index = word & ((1 << bpp) - 1)` and
-//! `run_length = (word >> bpp) + 1`. The firmware blitter (`FUN_0000fe48`) takes the mask from a
-//! 14-entry table, so `bpp` can be anything from 1 to 14 and the palette may hold up to
-//! `1 << bpp` colours (the firmware actually ships images with bpp 9..=12 and >256 colours).
+//! `run_length = (word >> bpp) + 1`. The firmware blitter (`gfx_blit_opaque`) takes the mask from a
+//! 15-entry table (`bpp` 0..=14), and copies the palette into a 6000-byte DTCM buffer, so a palette
+//! holds at most [`MAX_PALETTE_ENTRIES`] colours and never more than `1 << bpp` (the firmware ships
+//! images with bpp 9..=12 and up to 2611 colours).
 //!
 //! The pixel stream runs along framebuffer rows. The LCD framebuffer is 480x800 portrait and the
 //! panel is mounted landscape, so one framebuffer row is one screen *column*: the stream describes
@@ -35,6 +36,14 @@ pub const IMAGE_HEADER_SIZE: usize = 12;
 
 /// Largest palette index width supported by the firmware mask table at code address 0x101aa.
 pub const MAX_BPP: u16 = 14;
+
+/// Largest palette the firmware blitters can load.
+///
+/// `gfx_blit_opaque` and `gfx_blit_colorkey` memcpy `palette_entries * 2` bytes into the DTCM
+/// buffer at `0x2001d8dc` (`g_blit_palette`) with no bounds check. That buffer is 6000 bytes —
+/// the next live variable sits at `0x2001f04c` — so a palette holds at most 3000 RGB565 colours.
+/// The stock MG-30 image never exceeds 2611.
+pub const MAX_PALETTE_ENTRIES: u16 = 3000;
 
 /// RGB565 magenta (255, 28, 255 in RGB888) that the small-bank blitter skips.
 pub const COLOR_KEY_RGB565: u16 = 0xF8FF;
@@ -168,12 +177,12 @@ pub fn decode_rle_word(word: u16, bpp: u16) -> (usize, usize) {
     (palette_index, run_length)
 }
 
-/// Maximum palette size allowed for a given `bpp`.
+/// Maximum palette size allowed for a given `bpp`: `min(2^bpp, MAX_PALETTE_ENTRIES)`.
 pub fn max_palette_entries(bpp: u16) -> usize {
     if bpp == 0 || bpp > MAX_BPP {
         0
     } else {
-        1usize << bpp
+        (1usize << bpp).min(usize::from(MAX_PALETTE_ENTRIES))
     }
 }
 
@@ -188,7 +197,7 @@ pub fn validate_bpp_and_palette(bpp: u16, palette_entries: u16) -> Result<()> {
     let entries = palette_entries as usize;
     ensure!(
         (1..=max_palette).contains(&entries),
-        "palette_entries must be between 1 and {max_palette} for bpp={bpp}, got {palette_entries}"
+        "palette_entries must be between 1 and {max_palette} for bpp={bpp} (at most 2^bpp and {MAX_PALETTE_ENTRIES}, the firmware palette buffer), got {palette_entries}"
     );
 
     Ok(())
@@ -453,7 +462,7 @@ pub(crate) mod tests {
         validate_bpp_and_palette(4, 14).unwrap();
         validate_bpp_and_palette(8, 256).unwrap();
         validate_bpp_and_palette(12, 3000).unwrap();
-        validate_bpp_and_palette(14, 16384).unwrap();
+        validate_bpp_and_palette(14, 3000).unwrap();
     }
 
     #[test]
@@ -466,7 +475,8 @@ pub(crate) mod tests {
     fn validate_bpp_and_palette_rejects_too_many_entries() {
         assert!(validate_bpp_and_palette(4, 17).is_err());
         assert!(validate_bpp_and_palette(8, 257).is_err());
-        assert!(validate_bpp_and_palette(12, 4097).is_err());
+        assert!(validate_bpp_and_palette(12, 3001).is_err());
+        assert!(validate_bpp_and_palette(14, 16384).is_err());
     }
 
     #[test]
