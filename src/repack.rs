@@ -5,16 +5,31 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use image::{DynamicImage, GenericImageView};
 
+use crate::banks::{Bank, build_bank_region, read_banks};
 use crate::container::parse_nux_dfu;
-use crate::depacketize::clean_bina_rel_to_original_abs;
-use crate::export::{MANIFEST_FILE, ManifestImageEntry, load_manifest};
+use crate::depacketize::{depacketize_bina, patch_clean_range};
+use crate::export::{MANIFEST_FILE, Manifest, ManifestImageEntry, load_manifest};
 use crate::hash::sha512_file;
-use crate::image_format::{IMAGE_HEADER_SIZE, MAX_BPP, rgb565_to_rgb888, validate_bpp_and_palette};
+use crate::image_format::{
+    IMAGE_HEADER_SIZE, MAX_BPP, SCREEN_HEIGHT, SCREEN_WIDTH, decode_pixels, read_image_record,
+    rgb565_to_rgb888, validate_bpp_and_palette,
+};
+
+pub struct BankPackStats {
+    pub name: String,
+    pub rebuilt: bool,
+    pub reencoded: usize,
+    pub dimensions_changed: usize,
+    pub used_bytes_before: usize,
+    pub used_bytes_after: usize,
+    pub free_bytes_after: usize,
+}
 
 pub struct PackSummary {
     pub total: usize,
     pub skipped_unchanged: usize,
     pub patched: usize,
+    pub banks: Vec<BankPackStats>,
 }
 
 pub fn rgb888_to_rgb565(c: [u8; 3]) -> u16 {
@@ -49,27 +64,36 @@ pub fn validate_entry_format(entry: &ManifestImageEntry) -> Result<()> {
     validate_bpp_and_palette(entry.bpp, entry.palette_entries)
 }
 
+/// Firmware record dimensions for a PNG: `(width, height)` = `(vertical, horizontal)`.
+///
+/// The PNG is in screen orientation, so its width is the horizontal extent and its height the
+/// vertical one. Both must fit the panel.
+fn firmware_dimensions(png: &DynamicImage, entry: &ManifestImageEntry) -> Result<(u16, u16)> {
+    let horizontal = png.width();
+    let vertical = png.height();
+    ensure!(
+        (1..=u32::from(SCREEN_WIDTH)).contains(&horizontal)
+            && (1..=u32::from(SCREEN_HEIGHT)).contains(&vertical),
+        "PNG for index {} ({}) is {horizontal}x{vertical}, must be 1..={SCREEN_WIDTH} horizontal by 1..={SCREEN_HEIGHT} vertical",
+        entry.index,
+        entry.png
+    );
+    Ok((vertical as u16, horizontal as u16))
+}
+
 /// Converts the PNG into RGB565 pixels in firmware stream order (column-major on screen).
 ///
-/// Transparent pixels (alpha < 128) become the bank colour key when the entry has one.
-fn extract_source_pixels(png: &DynamicImage, entry: &ManifestImageEntry) -> Result<Vec<u16>> {
-    let src_w = u32::from(entry.width);
-    let src_h = u32::from(entry.height);
+/// Returns `(record width, record height, pixels)`. Transparent pixels (alpha < 128) become the
+/// bank colour key when the entry has one.
+fn extract_source_pixels(
+    png: &DynamicImage,
+    entry: &ManifestImageEntry,
+) -> Result<(u16, u16, Vec<u16>)> {
+    let (src_w, src_h) = firmware_dimensions(png, entry)?;
 
-    ensure!(
-        png.width() == src_h && png.height() == src_w,
-        "PNG dimensions mismatch for index {} ({}): expected {}x{} (output), got {}x{}",
-        entry.index,
-        entry.png,
-        src_h,
-        src_w,
-        png.width(),
-        png.height()
-    );
-
-    let mut pixels = Vec::with_capacity((src_w * src_h) as usize);
-    for y in 0..src_h {
-        for x in 0..src_w {
+    let mut pixels = Vec::with_capacity(usize::from(src_w) * usize::from(src_h));
+    for y in 0..u32::from(src_h) {
+        for x in 0..u32::from(src_w) {
             let p = png.get_pixel(y, x).0;
             let c = match entry.color_key {
                 Some(key) if p[3] < 128 => key,
@@ -79,7 +103,7 @@ fn extract_source_pixels(png: &DynamicImage, entry: &ManifestImageEntry) -> Resu
         }
     }
 
-    Ok(pixels)
+    Ok((src_w, src_h, pixels))
 }
 
 /// Builds a palette of at most `palette_entries` colours (most frequent first) and maps every
@@ -164,7 +188,10 @@ fn rle_encode(indices: &[u16], bpp: u16) -> Result<Vec<u16>> {
     Ok(words)
 }
 
-/// Encodes a PNG into a firmware record using the format parameters from the manifest entry.
+/// Encodes a PNG into a firmware record.
+///
+/// Dimensions come from the PNG. `bpp`, `palette_entries` and `color_key` come from the manifest.
+/// The result is the exact record, with no slot padding.
 pub fn encode_record(entry: &ManifestImageEntry, png: &DynamicImage) -> Result<Vec<u8>> {
     validate_entry_format(entry).with_context(|| {
         format!(
@@ -173,12 +200,12 @@ pub fn encode_record(entry: &ManifestImageEntry, png: &DynamicImage) -> Result<V
         )
     })?;
 
-    let pixels = extract_source_pixels(png, entry)?;
+    let (width, height, pixels) = extract_source_pixels(png, entry)?;
 
-    let mut out = Vec::with_capacity(entry.record_size_bytes);
+    let mut out = Vec::new();
     out.extend_from_slice(&entry.bpp.to_le_bytes());
-    out.extend_from_slice(&entry.width.to_le_bytes());
-    out.extend_from_slice(&entry.height.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
     out.extend_from_slice(&entry.palette_entries.to_le_bytes());
 
     if entry.bpp == 0 {
@@ -200,77 +227,31 @@ pub fn encode_record(entry: &ManifestImageEntry, png: &DynamicImage) -> Result<V
         }
     }
 
-    if out.len() > entry.record_size_bytes {
+    Ok(out)
+}
+
+/// Scan-mode packing: the record must still fit the original slot, and a short record is padded
+/// with zeros so the following record stays put.
+fn fit_in_slot(entry: &ManifestImageEntry, mut record: Vec<u8>) -> Result<Vec<u8>> {
+    if record.len() > entry.record_size_bytes {
         bail!(
             "re-encoded image index {} ({}) is too large: {} bytes, limit {} bytes",
             entry.index,
             entry.png,
-            out.len(),
+            record.len(),
             entry.record_size_bytes
         );
     }
-
-    out.resize(entry.record_size_bytes, 0);
-    Ok(out)
+    record.resize(entry.record_size_bytes, 0);
+    Ok(record)
 }
 
-fn patch_record(
-    firmware: &mut [u8],
-    entry: &ManifestImageEntry,
-    record_bytes: &[u8],
-    bina_abs_offset: usize,
-) -> Result<()> {
-    ensure!(
-        record_bytes.len() == entry.record_size_bytes,
-        "record byte length mismatch for index {}",
-        entry.index
-    );
-
-    for (i, &byte) in record_bytes.iter().enumerate() {
-        let clean_rel = entry.clean_bina_offset + i;
-        let abs = clean_bina_rel_to_original_abs(clean_rel, bina_abs_offset);
-        let slot = firmware
-            .get_mut(abs)
-            .with_context(|| {
-                format!(
-                    "patch offset out of bounds for index {} at clean_rel=0x{clean_rel:x}, abs=0x{abs:x}",
-                    entry.index
-                )
-            })?;
-        *slot = byte;
-    }
-
-    Ok(())
-}
-
-pub fn pack(firmware_path: &Path, out_dir: &Path, output_path: &Path) -> Result<PackSummary> {
-    let manifest_path = out_dir.join(MANIFEST_FILE);
-    let manifest = load_manifest(&manifest_path)?;
-
-    for entry in &manifest.images {
-        validate_entry_format(entry).with_context(|| {
-            format!(
-                "invalid manifest entry index {} ({}): bpp={}, palette_entries={}",
-                entry.index, entry.png, entry.bpp, entry.palette_entries
-            )
-        })?;
-        ensure!(
-            entry.record_size_bytes >= IMAGE_HEADER_SIZE,
-            "invalid record_size_bytes for index {}",
-            entry.index
-        );
-    }
-
-    let mut firmware = fs::read(firmware_path)
-        .with_context(|| format!("failed to read firmware {}", firmware_path.display()))?;
-    let fw = parse_nux_dfu(&firmware)?;
-    let bina = fw
-        .section("BINA")
-        .ok_or_else(|| anyhow::anyhow!("BINA section not found"))?;
-    let bina_abs_offset = bina.offset;
-
+fn load_changed_pngs(
+    manifest: &Manifest,
+    out_dir: &Path,
+) -> Result<(HashMap<usize, DynamicImage>, usize)> {
+    let mut changed = HashMap::new();
     let mut skipped_unchanged = 0usize;
-    let mut patched = 0usize;
 
     for entry in &manifest.images {
         let png_path = out_dir.join(&entry.png);
@@ -294,11 +275,294 @@ pub fn pack(firmware_path: &Path, out_dir: &Path, output_path: &Path) -> Result<
                 png_path.display()
             )
         })?;
-
-        let record_bytes = encode_record(entry, &png)?;
-        patch_record(&mut firmware, entry, &record_bytes, bina_abs_offset)?;
-        patched += 1;
+        ensure!(
+            changed.insert(entry.index, png).is_none(),
+            "duplicate manifest index {}",
+            entry.index
+        );
     }
+
+    Ok((changed, skipped_unchanged))
+}
+
+/// Scan manifests have no index table, so each record is patched inside its original slot.
+fn patch_in_place(
+    firmware: &mut [u8],
+    bina_abs_offset: usize,
+    manifest: &Manifest,
+    changed: &HashMap<usize, DynamicImage>,
+) -> Result<()> {
+    for entry in &manifest.images {
+        let Some(png) = changed.get(&entry.index) else {
+            continue;
+        };
+        ensure!(
+            entry.record_size_bytes >= IMAGE_HEADER_SIZE,
+            "invalid record_size_bytes for index {}",
+            entry.index
+        );
+        let record = encode_record(entry, png)?;
+        let padded = fit_in_slot(entry, record)?;
+        patch_clean_range(firmware, bina_abs_offset, entry.clean_bina_offset, &padded)
+            .with_context(|| format!("failed to patch index {} ({})", entry.index, entry.png))?;
+    }
+    Ok(())
+}
+
+struct RebuiltBank {
+    encoded: HashMap<usize, Vec<u8>>,
+    reencoded: usize,
+    dimensions_changed: usize,
+}
+
+/// Table manifests: any bank with a changed image is rewritten from scratch (records packed by
+/// `bank_index`, index table regenerated). Banks with nothing changed are left byte for byte.
+fn rebuild_tables(
+    firmware: &mut [u8],
+    bina_abs_offset: usize,
+    manifest: &Manifest,
+    changed: &HashMap<usize, DynamicImage>,
+) -> Result<Vec<BankPackStats>> {
+    let bina_end = bina_abs_offset
+        + parse_nux_dfu(firmware)?
+            .section("BINA")
+            .map(|s| s.size)
+            .ok_or_else(|| anyhow::anyhow!("BINA section not found"))?;
+    let original_clean = depacketize_bina(&firmware[bina_abs_offset..bina_end]);
+    let banks = read_banks(&original_clean)?;
+
+    let mut by_name: HashMap<&str, &Bank> = HashMap::new();
+    for bank in &banks {
+        by_name.insert(bank.name(), bank);
+    }
+
+    let mut manifest_by_bank: HashMap<&str, HashMap<usize, &ManifestImageEntry>> = HashMap::new();
+    for entry in &manifest.images {
+        let bank = by_name.get(entry.bank.as_str()).with_context(|| {
+            format!(
+                "manifest entry {} refers to unknown bank \"{}\"",
+                entry.index, entry.bank
+            )
+        })?;
+        ensure!(
+            entry.bank_index < bank.entries.len(),
+            "manifest entry {} bank_index {} is outside the {} bank ({} entries)",
+            entry.index,
+            entry.bank_index,
+            bank.name(),
+            bank.entries.len()
+        );
+        let slots = manifest_by_bank.entry(bank.name()).or_default();
+        ensure!(
+            slots.insert(entry.bank_index, entry).is_none(),
+            "{} bank index {} is listed twice in the manifest",
+            bank.name(),
+            entry.bank_index
+        );
+    }
+
+    let mut rebuilt: HashMap<&str, RebuiltBank> = HashMap::new();
+    for bank in &banks {
+        let listed = manifest_by_bank.get(bank.name());
+        let mut encoded = HashMap::new();
+        let mut dimensions_changed = 0usize;
+        for entry_in_bank in &bank.entries {
+            let Some(entry) = listed.and_then(|slots| slots.get(&entry_in_bank.index)) else {
+                continue;
+            };
+            let Some(png) = changed.get(&entry.index) else {
+                continue;
+            };
+            if png.width() != u32::from(entry.output_width)
+                || png.height() != u32::from(entry.output_height)
+            {
+                dimensions_changed += 1;
+            }
+            encoded.insert(entry_in_bank.index, encode_record(entry, png)?);
+        }
+        if encoded.is_empty() {
+            continue;
+        }
+
+        let mut records = Vec::with_capacity(bank.entries.len());
+        for entry_in_bank in &bank.entries {
+            let bytes = if let Some(encoded) = encoded.get(&entry_in_bank.index) {
+                encoded.clone()
+            } else {
+                let record = &entry_in_bank.record;
+                original_clean[record.offset..record.end()].to_vec()
+            };
+            records.push(bytes);
+        }
+        let record_refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let region = build_bank_region(&bank.layout, &record_refs)
+            .with_context(|| format!("failed to rebuild the {} bank", bank.name()))?;
+        patch_clean_range(firmware, bina_abs_offset, bank.region_bina_start(), &region)
+            .with_context(|| format!("failed to write the rebuilt {} bank", bank.name()))?;
+
+        let reencoded = encoded.len();
+        rebuilt.insert(
+            bank.name(),
+            RebuiltBank {
+                encoded,
+                reencoded,
+                dimensions_changed,
+            },
+        );
+    }
+
+    verify_rebuilt_banks(firmware, bina_abs_offset, &original_clean, &banks, &rebuilt)
+}
+
+fn verify_rebuilt_banks(
+    firmware: &[u8],
+    bina_abs_offset: usize,
+    original_clean: &[u8],
+    banks: &[Bank],
+    rebuilt: &HashMap<&str, RebuiltBank>,
+) -> Result<Vec<BankPackStats>> {
+    let bina_end = bina_abs_offset
+        + parse_nux_dfu(firmware)?
+            .section("BINA")
+            .map(|section| section.size)
+            .ok_or_else(|| anyhow::anyhow!("BINA section not found"))?;
+    let patched_clean = depacketize_bina(&firmware[bina_abs_offset..bina_end]);
+    let patched_banks =
+        read_banks(&patched_clean).context("patched firmware banks could not be read back")?;
+
+    let mut stats = Vec::with_capacity(banks.len());
+    for (original, patched) in banks.iter().zip(patched_banks.iter()) {
+        ensure!(
+            original.name() == patched.name(),
+            "bank order changed while rebuilding"
+        );
+        let Some(job) = rebuilt.get(original.name()) else {
+            let start = original.region_bina_start();
+            let end = start + original.layout.region_bytes();
+            let original_region = original_clean.get(start..end).with_context(|| {
+                format!(
+                    "{} bank region is outside the original image",
+                    original.name()
+                )
+            })?;
+            let patched_region = patched_clean.get(start..end).with_context(|| {
+                format!(
+                    "{} bank region is outside the patched image",
+                    original.name()
+                )
+            })?;
+            ensure!(
+                original_region == patched_region,
+                "{} bank changed even though none of its images did",
+                original.name()
+            );
+            stats.push(BankPackStats {
+                name: original.name().to_owned(),
+                rebuilt: false,
+                reencoded: 0,
+                dimensions_changed: 0,
+                used_bytes_before: original.used_bytes(),
+                used_bytes_after: original.used_bytes(),
+                free_bytes_after: original.free_bytes(),
+            });
+            continue;
+        };
+
+        ensure!(
+            original.entries.len() == patched.entries.len(),
+            "{} bank entry count changed from {} to {}",
+            original.name(),
+            original.entries.len(),
+            patched.entries.len()
+        );
+        for (before, after) in original.entries.iter().zip(patched.entries.iter()) {
+            ensure!(
+                before.index == after.index,
+                "{} bank indices shifted during rebuild",
+                original.name()
+            );
+            let actual = patched_clean
+                .get(after.record.offset..after.record.end())
+                .with_context(|| {
+                    format!(
+                        "{} #{} record is outside the patched image",
+                        original.name(),
+                        after.index
+                    )
+                })?;
+            if let Some(encoded) = job.encoded.get(&before.index) {
+                ensure!(
+                    actual == encoded.as_slice(),
+                    "{} #{} record bytes differ after rebuild",
+                    original.name(),
+                    before.index
+                );
+                let decoded = decode_pixels(&patched_clean, &after.record)?;
+                let expected_record = read_image_record(encoded, 0)?;
+                let expected = decode_pixels(encoded, &expected_record)?;
+                ensure!(
+                    decoded.pixels == expected.pixels,
+                    "{} #{} pixels differ after rebuild",
+                    original.name(),
+                    before.index
+                );
+            } else {
+                let untouched = &original_clean[before.record.offset..before.record.end()];
+                ensure!(
+                    actual == untouched,
+                    "{} #{} was not edited but its record bytes changed",
+                    original.name(),
+                    before.index
+                );
+            }
+        }
+
+        stats.push(BankPackStats {
+            name: original.name().to_owned(),
+            rebuilt: true,
+            reencoded: job.reencoded,
+            dimensions_changed: job.dimensions_changed,
+            used_bytes_before: original.used_bytes(),
+            used_bytes_after: patched.used_bytes(),
+            free_bytes_after: patched.free_bytes(),
+        });
+    }
+
+    Ok(stats)
+}
+
+pub fn pack(firmware_path: &Path, out_dir: &Path, output_path: &Path) -> Result<PackSummary> {
+    let manifest_path = out_dir.join(MANIFEST_FILE);
+    let manifest = load_manifest(&manifest_path)?;
+
+    for entry in &manifest.images {
+        validate_entry_format(entry).with_context(|| {
+            format!(
+                "invalid manifest entry index {} ({}): bpp={}, palette_entries={}",
+                entry.index, entry.png, entry.bpp, entry.palette_entries
+            )
+        })?;
+    }
+
+    let mut firmware = fs::read(firmware_path)
+        .with_context(|| format!("failed to read firmware {}", firmware_path.display()))?;
+    let fw = parse_nux_dfu(&firmware)?;
+    let bina = fw
+        .section("BINA")
+        .ok_or_else(|| anyhow::anyhow!("BINA section not found"))?;
+    let bina_abs_offset = bina.offset;
+
+    let (changed, skipped_unchanged) = load_changed_pngs(&manifest, out_dir)?;
+    let patched = changed.len();
+
+    let banks = match manifest.summary.discovery.as_str() {
+        "table" => rebuild_tables(&mut firmware, bina_abs_offset, &manifest, &changed)?,
+        "scan" => {
+            patch_in_place(&mut firmware, bina_abs_offset, &manifest, &changed)?;
+            Vec::new()
+        }
+        other => bail!("manifest discovery mode \"{other}\" is not supported"),
+    };
 
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
@@ -310,6 +574,7 @@ pub fn pack(firmware_path: &Path, out_dir: &Path, output_path: &Path) -> Result<
         total: manifest.images.len(),
         skipped_unchanged,
         patched,
+        banks,
     })
 }
 
@@ -358,17 +623,12 @@ mod tests {
         DynamicImage::ImageRgba8(img)
     }
 
-    fn trim(record: Vec<u8>) -> Vec<u8> {
-        let rec = read_image_record(&record, 0).unwrap();
-        record[..rec.record_size_bytes()].to_vec()
-    }
-
     #[test]
     fn round_trips_high_bpp_image() {
         let (w, h) = (40u32, 25u32);
         let png = gradient(w, h);
         let e = entry(12, 4096, w as u16, h as u16, None);
-        let record = trim(encode_record(&e, &png).unwrap());
+        let record = encode_record(&e, &png).unwrap();
         let rec = read_image_record(&record, 0).unwrap();
         assert_eq!(rec.header.bpp, 12);
         let decoded = decode_pixels(&record, &rec).unwrap();
@@ -386,7 +646,7 @@ mod tests {
         let (w, h) = (9u32, 4u32);
         let png = gradient(w, h);
         let e = entry(0, 0, w as u16, h as u16, None);
-        let record = trim(encode_record(&e, &png).unwrap());
+        let record = encode_record(&e, &png).unwrap();
         let rec = read_image_record(&record, 0).unwrap();
         assert!(rec.header.is_raw());
         assert_eq!(
@@ -404,7 +664,7 @@ mod tests {
         img.put_pixel(0, 0, Rgba([10, 20, 30, 0]));
         img.put_pixel(1, 0, Rgba([255, 255, 255, 255]));
         let e = entry(1, 2, 2, 1, Some(COLOR_KEY_RGB565));
-        let record = trim(encode_record(&e, &DynamicImage::ImageRgba8(img)).unwrap());
+        let record = encode_record(&e, &DynamicImage::ImageRgba8(img)).unwrap();
         let rec = read_image_record(&record, 0).unwrap();
         let decoded = decode_pixels(&record, &rec).unwrap();
         assert_eq!(decoded.pixels, vec![COLOR_KEY_RGB565, 0xffff]);
@@ -418,11 +678,31 @@ mod tests {
     }
 
     #[test]
-    fn too_large_record_is_rejected() {
+    fn png_dimensions_override_the_manifest() {
+        let png = gradient(5, 3);
+        // Manifest still describes the original 9x9 slot; the record follows the PNG.
+        let entry = entry(4, 16, 9, 9, None);
+        let record = encode_record(&entry, &png).unwrap();
+        let rec = read_image_record(&record, 0).unwrap();
+        assert_eq!(rec.header.width, 3);
+        assert_eq!(rec.header.height, 5);
+        assert_eq!(record.len(), rec.record_size_bytes());
+    }
+
+    #[test]
+    fn rejects_png_larger_than_the_screen() {
+        let png = DynamicImage::ImageRgba8(RgbaImage::new(801, 1));
+        let err = encode_record(&entry(4, 16, 1, 1, None), &png).unwrap_err();
+        assert!(err.to_string().contains("800"), "{err}");
+    }
+
+    #[test]
+    fn too_large_record_is_rejected_for_in_place_slots() {
         let png = gradient(40, 25);
-        let mut e = entry(8, 256, 40, 25, None);
-        e.record_size_bytes = 64;
-        let err = encode_record(&e, &png).unwrap_err();
+        let mut entry = entry(8, 256, 40, 25, None);
+        entry.record_size_bytes = 64;
+        let record = encode_record(&entry, &png).unwrap();
+        let err = fit_in_slot(&entry, record).unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
     }
 }

@@ -433,6 +433,21 @@ fn repack_images(args: PackArgs) -> Result<()> {
     println!("  manifest images: {}", summary.total);
     println!("  unchanged:       {}", summary.skipped_unchanged);
     println!("  patched:         {}", summary.patched);
+    for bank in &summary.banks {
+        if bank.rebuilt {
+            println!(
+                "  {:<5} rebuilt: {} re-encoded, {} resized, {} -> {} KiB used, {} KiB free",
+                bank.name,
+                bank.reencoded,
+                bank.dimensions_changed,
+                bank.used_bytes_before / 1024,
+                bank.used_bytes_after / 1024,
+                bank.free_bytes_after / 1024,
+            );
+        } else {
+            println!("  {:<5} unchanged", bank.name);
+        }
+    }
     println!("  output:          {}", args.output.display());
 
     Ok(())

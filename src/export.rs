@@ -24,18 +24,21 @@ pub struct ManifestImageEntry {
     pub clean_bina_offset: usize,
     pub clean_abs_offset: usize,
     pub original_abs_offset: usize,
-    /// Record header `width`: pixels along a framebuffer row (vertical on screen).
+    /// Record header `width` in the original firmware: pixels along a framebuffer row (vertical on
+    /// screen). `pack` takes the replacement dimensions from the PNG.
     pub width: u16,
-    /// Record header `height`: framebuffer rows (horizontal on screen).
+    /// Record header `height` in the original firmware: framebuffer rows (horizontal on screen).
     pub height: u16,
-    /// PNG width (horizontal).
+    /// PNG width (horizontal) of the extracted image.
     pub output_width: u16,
-    /// PNG height (vertical).
+    /// PNG height (vertical) of the extracted image.
     pub output_height: u16,
     /// 0 = raw RGB565, 1..=14 = palette index bits.
     pub bpp: u16,
     pub palette_entries: u16,
     pub rle_words: u32,
+    /// Size of this record in the original firmware. Table manifests are relaid out, so this is not
+    /// a limit there; scan manifests are still patched in place and must fit this slot.
     pub record_size_bytes: usize,
     /// RGB565 colour the firmware treats as transparent for this bank. When set, the PNG is RGBA
     /// and key pixels have alpha 0.
