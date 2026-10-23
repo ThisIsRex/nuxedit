@@ -67,6 +67,11 @@ impl BankLayout {
     pub fn table_flash_address(&self) -> u32 {
         EXT_IMAGE_FLASH_BASE + self.table_offset as u32
     }
+
+    /// Bytes reserved for this bank, from the table base to the next flash region.
+    pub fn region_bytes(&self) -> usize {
+        self.region_end.saturating_sub(self.table_offset)
+    }
 }
 
 pub const MG30_BANKS: [BankLayout; 3] = [
@@ -124,6 +129,11 @@ impl Bank {
         self.layout.name
     }
 
+    /// Clean-BINA offset where this bank's region (index table included) starts.
+    pub fn region_bina_start(&self) -> usize {
+        self.table_bina_offset
+    }
+
     pub fn records_start(&self) -> usize {
         self.table_bina_offset + RECORDS_OFFSET_FROM_TABLE
     }
@@ -142,7 +152,7 @@ impl Bank {
 
     /// Bytes left before the next flash region.
     pub fn free_bytes(&self) -> usize {
-        let region_end = self.table_bina_offset - self.layout.table_offset + self.layout.region_end;
+        let region_end = self.region_bina_start() + self.layout.region_bytes();
         region_end.saturating_sub(self.records_end())
     }
 
@@ -273,6 +283,88 @@ pub fn read_banks_at(clean_bina: &[u8], ext_base: usize) -> Result<Vec<Bank>> {
         .iter()
         .map(|layout| read_bank(clean_bina, layout, ext_base))
         .collect()
+}
+
+fn write_u32(buf: &mut [u8], off: usize, value: u32) {
+    buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    value.div_ceil(align) * align
+}
+
+/// Builds one bank region: a zero-terminated index table at the start and the records packed from
+/// offset `0x8000`, each record start rounded up to 4 bytes (the alignment every MG-30 record
+/// has). The result is exactly [`BankLayout::region_bytes`] long, so it can replace the region
+/// `[table_offset, region_end)` in the external-flash image.
+///
+/// `records` is in table order. For the font bank the glyph dimensions written to the table come
+/// from the record itself (`height` = record `width`, `width` = record `height`), which is the
+/// relation [`read_bank`] checks.
+pub fn build_bank_region(layout: &BankLayout, records: &[&[u8]]) -> Result<Vec<u8>> {
+    ensure!(
+        records.len() <= layout.max_entries,
+        "{} bank has {} records, table holds at most {}",
+        layout.name,
+        records.len(),
+        layout.max_entries
+    );
+    ensure!(
+        records.len() * layout.entry_size() <= RECORDS_OFFSET_FROM_TABLE,
+        "{} bank table ({} entries) does not fit before the record area",
+        layout.name,
+        records.len()
+    );
+
+    let mut parsed = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        let header = read_image_record(record, 0).with_context(|| {
+            format!(
+                "{} bank: record {index} is not a valid image record",
+                layout.name
+            )
+        })?;
+        ensure!(
+            record.len() == header.record_size_bytes(),
+            "{} bank: record {index} is {} bytes but its header describes {}",
+            layout.name,
+            record.len(),
+            header.record_size_bytes()
+        );
+        parsed.push(header);
+    }
+
+    let region_len = layout.region_bytes();
+    let mut region = vec![0u8; region_len];
+    let mut cursor = RECORDS_OFFSET_FROM_TABLE;
+
+    for (index, record) in records.iter().enumerate() {
+        let aligned = align_up(cursor, 4);
+        let end = aligned + record.len();
+        if end > region_len {
+            bail!(
+                "{} bank region exceeded by {} bytes (records need 0x{end:x}, region is 0x{region_len:x})",
+                layout.name,
+                end - region_len
+            );
+        }
+        region[aligned..end].copy_from_slice(record);
+
+        let entry_off = index * layout.entry_size();
+        match layout.entry_kind {
+            TableEntryKind::Offset => write_u32(&mut region, entry_off, aligned as u32),
+            TableEntryKind::Glyph => {
+                let header = parsed[index].header;
+                // Glyph height is the vertical extent, which the record calls `width`.
+                write_u32(&mut region, entry_off, u32::from(header.width));
+                write_u32(&mut region, entry_off + 4, u32::from(header.height));
+                write_u32(&mut region, entry_off + 8, aligned as u32);
+            }
+        }
+        cursor = end;
+    }
+
+    Ok(region)
 }
 
 #[cfg(test)]
@@ -409,5 +501,85 @@ mod tests {
         assert_eq!(MG30_BANKS[0].table_flash_address(), 0x604C_0000);
         assert_eq!(MG30_BANKS[1].table_flash_address(), 0x605C_0000);
         assert_eq!(MG30_BANKS[2].table_flash_address(), 0x60D4_0000);
+    }
+
+    fn region_as_image(layout: &BankLayout, region: &[u8]) -> Vec<u8> {
+        let mut image = vec![0u8; layout.table_offset + region.len()];
+        image[layout.table_offset..].copy_from_slice(region);
+        image
+    }
+
+    #[test]
+    fn build_bank_region_round_trips_and_aligns_to_4() {
+        let layout = layout_for_test();
+        // pal 2 + 3 rle words is odd, so the record ends 2 bytes past a 4-byte boundary.
+        let rec_a = build_record(2, 3, 1, &[10, 20], &[10, 20, 10]);
+        let rec_b = build_record(1, 1, 1, &[5], &[5]);
+        assert_eq!((rec_a.len()) % 4, 2);
+
+        let region = build_bank_region(&layout, &[&rec_a, &rec_b]).unwrap();
+        assert_eq!(region.len(), layout.region_bytes());
+        let bank = read_bank(&region_as_image(&layout, &region), &layout, 0).unwrap();
+
+        assert_eq!(bank.entries.len(), 2);
+        for (entry, rec) in bank.entries.iter().zip([&rec_a, &rec_b]) {
+            let start = entry.record.offset - layout.table_offset;
+            assert_eq!(start % 4, 0, "record start not 4-aligned");
+            assert_eq!(&region[start..start + rec.len()], rec.as_slice());
+        }
+        let gap = bank.entries[1].record.offset - bank.entries[0].record.end();
+        assert_eq!(gap, 2);
+        // The slot after the last entry is the zero terminator.
+        assert_eq!(&region[2 * 4..3 * 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn build_bank_region_reports_overflow_amount() {
+        let mut layout = layout_for_test();
+        layout.region_end = layout.table_offset + RECORDS_OFFSET_FROM_TABLE + 4;
+        let rec = build_record(1, 2, 2, &[7, 8], &[7, 8, 8, 7]);
+        let overflow = rec.len() - 4;
+        let err = build_bank_region(&layout, &[&rec]).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("{overflow} bytes")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_bank_region_rejects_too_many_entries() {
+        let mut layout = layout_for_test();
+        layout.max_entries = 1;
+        let rec = build_record(1, 1, 1, &[5], &[5]);
+        let err = build_bank_region(&layout, &[&rec, &rec]).unwrap_err();
+        assert!(err.to_string().contains("at most 1"), "{err}");
+    }
+
+    #[test]
+    fn build_bank_region_glyph_table_follows_record() {
+        let layout = glyph_layout_for_test();
+        // 4 px wide, 6 px tall on screen -> record width 6 (vertical), height 4 (horizontal).
+        let pixels = vec![1u16; 24];
+        let rec = build_record(1, 4, 6, &[0, 1], &pixels);
+        let region = build_bank_region(&layout, &[&rec]).unwrap();
+
+        let (height, width, off) = (
+            u32::from_le_bytes(region[0..4].try_into().unwrap()),
+            u32::from_le_bytes(region[4..8].try_into().unwrap()),
+            u32::from_le_bytes(region[8..12].try_into().unwrap()),
+        );
+        assert_eq!(
+            (height, width, off),
+            (6, 4, RECORDS_OFFSET_FROM_TABLE as u32)
+        );
+
+        let bank = read_bank(&region_as_image(&layout, &region), &layout, 0).unwrap();
+        assert_eq!(
+            bank.entries[0].glyph,
+            Some(GlyphInfo {
+                height: 6,
+                width: 4
+            })
+        );
     }
 }
